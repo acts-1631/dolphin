@@ -2464,7 +2464,7 @@ void NetPlayClient::SendTimeBase()
 {
   std::lock_guard lk(crit_netplay_client);
 
-  if (netplay_client->m_timebase_frame % 60 == 0)
+  if (netplay_client->m_timebase_frame % TIMEBASE_FRAME_INTERVAL == 0)
   {
     const u64 timebase = Core::System::GetInstance().GetSystemTimers().GetFakeTimeBase();
 
