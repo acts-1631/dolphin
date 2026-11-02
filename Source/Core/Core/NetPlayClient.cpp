@@ -50,6 +50,7 @@
 #include "Core/HW/GBAPad.h"
 #include "Core/HW/GCMemcard/GCMemcard.h"
 #include "Core/HW/GCPad.h"
+#include "Core/HW/Memmap.h"
 #include "Core/HW/SI/SI.h"
 #include "Core/HW/SI/SI_Device.h"
 #include "Core/HW/SI/SI_DeviceAMBaseboard.h"
@@ -79,6 +80,9 @@ using namespace WiimoteCommon;
 static std::mutex crit_netplay_client;
 static NetPlayClient* netplay_client = nullptr;
 static bool s_si_poll_batching = false;
+
+// The RAM override UI permits up to 256 MiB of MEM2.
+constexpr u32 MAX_NETPLAY_MEM2_SIZE = 0x10000000U;
 
 // called from ---GUI--- thread
 NetPlayClient::~NetPlayClient()
@@ -938,6 +942,18 @@ void NetPlayClient::OnStartGame(sf::Packet& packet)
 
     for (size_t i = 0; i < sizeof(m_net_settings.sram); ++i)
       packet >> m_net_settings.sram[i];
+
+    const bool invalid_memory_sizes = m_net_settings.ram_override_enable &&
+                                      (m_net_settings.mem1_size < Memory::MEM1_SIZE_RETAIL ||
+                                       m_net_settings.mem1_size > Memory::MEM1_SIZE_MAX ||
+                                       m_net_settings.mem2_size < Memory::MEM2_SIZE_RETAIL ||
+                                       m_net_settings.mem2_size > MAX_NETPLAY_MEM2_SIZE);
+    if (!packet || invalid_memory_sizes)
+    {
+      PanicAlertFmtT("The NetPlay host sent invalid game settings.");
+      m_do_loop.Clear();
+      return;
+    }
 
     m_net_settings.is_hosting = m_local_player->IsHost();
   }
