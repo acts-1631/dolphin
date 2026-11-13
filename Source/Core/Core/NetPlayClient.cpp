@@ -334,12 +334,22 @@ static void ReceiveSyncIdentifier(sf::Packet& spac, SyncIdentifier& sync_identif
 }
 
 // called from ---NETPLAY--- thread
-void NetPlayClient::OnData(sf::Packet& packet)
+void NetPlayClient::OnData(sf::Packet& packet, const bool is_chunked_payload)
 {
-  MessageID mid;
+  MessageID mid{};
   packet >> mid;
+  if (!packet)
+    return;
 
   INFO_LOG_FMT(NETPLAY, "Got server message: {:x}", static_cast<u8>(mid));
+
+  if (is_chunked_payload &&
+      (mid == MessageID::ChunkedDataStart || mid == MessageID::ChunkedDataEnd ||
+       mid == MessageID::ChunkedDataPayload || mid == MessageID::ChunkedDataAbort))
+  {
+    WARN_LOG_FMT(NETPLAY, "Ignoring nested chunk control message {:x}.", static_cast<u8>(mid));
+    return;
+  }
 
   switch (mid)
   {
@@ -535,15 +545,25 @@ void NetPlayClient::OnChatMessage(sf::Packet& packet)
 
 void NetPlayClient::OnChunkedDataStart(sf::Packet& packet)
 {
-  u32 cid;
-  packet >> cid;
+  u32 cid{};
   std::string title;
-  packet >> title;
-  const u64 data_size = Common::PacketReadU64(packet);
+  u64 data_size{};
+  packet >> cid >> title >> data_size;
+  if (!packet)
+  {
+    WARN_LOG_FMT(NETPLAY, "Ignoring invalid data chunk start.");
+    return;
+  }
+
+  if (!m_chunked_data_receive_queue.empty())
+  {
+    WARN_LOG_FMT(NETPLAY, "Ignoring data chunk {} while another transfer is active.", cid);
+    return;
+  }
 
   INFO_LOG_FMT(NETPLAY, "Starting data chunk {}.", cid);
 
-  m_chunked_data_receive_queue.emplace(cid, sf::Packet{});
+  m_chunked_data_receive_queue.emplace(cid, ChunkedData{data_size, {}});
 
   std::vector<int> players;
   players.push_back(m_local_player->pid);
@@ -552,8 +572,13 @@ void NetPlayClient::OnChunkedDataStart(sf::Packet& packet)
 
 void NetPlayClient::OnChunkedDataEnd(sf::Packet& packet)
 {
-  u32 cid;
+  u32 cid{};
   packet >> cid;
+  if (!packet)
+  {
+    WARN_LOG_FMT(NETPLAY, "Ignoring invalid data chunk end.");
+    return;
+  }
 
   const auto data_packet_iter = m_chunked_data_receive_queue.find(cid);
   if (data_packet_iter == m_chunked_data_receive_queue.end())
@@ -564,10 +589,19 @@ void NetPlayClient::OnChunkedDataEnd(sf::Packet& packet)
 
   INFO_LOG_FMT(NETPLAY, "Ending data chunk {}.", cid);
 
-  auto& data_packet = data_packet_iter->second;
-  OnData(data_packet);
+  if (data_packet_iter->second.packet.getDataSize() != data_packet_iter->second.expected_size)
+  {
+    WARN_LOG_FMT(NETPLAY, "Data chunk {} ended at an unexpected size.", cid);
+    m_chunked_data_receive_queue.erase(data_packet_iter);
+    m_dialog->HideChunkedProgressDialog();
+    return;
+  }
+
+  sf::Packet data_packet = std::move(data_packet_iter->second.packet);
   m_chunked_data_receive_queue.erase(data_packet_iter);
   m_dialog->HideChunkedProgressDialog();
+
+  OnData(data_packet, true);
 
   sf::Packet complete_packet;
   complete_packet << MessageID::ChunkedDataComplete;
@@ -577,8 +611,13 @@ void NetPlayClient::OnChunkedDataEnd(sf::Packet& packet)
 
 void NetPlayClient::OnChunkedDataPayload(sf::Packet& packet)
 {
-  u32 cid;
+  u32 cid{};
   packet >> cid;
+  if (!packet)
+  {
+    WARN_LOG_FMT(NETPLAY, "Ignoring invalid data chunk payload.");
+    return;
+  }
 
   const auto data_packet_iter = m_chunked_data_receive_queue.find(cid);
   if (data_packet_iter == m_chunked_data_receive_queue.end())
@@ -587,29 +626,48 @@ void NetPlayClient::OnChunkedDataPayload(sf::Packet& packet)
     return;
   }
 
-  auto& data_packet = data_packet_iter->second;
+  auto& chunked_data = data_packet_iter->second;
   while (!packet.endOfPacket())
   {
-    u8 byte;
+    if (chunked_data.packet.getDataSize() >= chunked_data.expected_size)
+    {
+      WARN_LOG_FMT(NETPLAY, "Data chunk {} exceeded its declared size.", cid);
+      m_chunked_data_receive_queue.erase(data_packet_iter);
+      m_dialog->HideChunkedProgressDialog();
+      return;
+    }
+
+    u8 byte{};
     packet >> byte;
-    data_packet << byte;
+    if (!packet)
+    {
+      WARN_LOG_FMT(NETPLAY, "Ignoring invalid data chunk payload.");
+      return;
+    }
+    chunked_data.packet << byte;
   }
 
-  INFO_LOG_FMT(NETPLAY, "Received {} bytes of data chunk {}.", data_packet.getDataSize(), cid);
+  INFO_LOG_FMT(NETPLAY, "Received {} bytes of data chunk {}.", chunked_data.packet.getDataSize(),
+               cid);
 
-  m_dialog->SetChunkedProgress(m_local_player->pid, data_packet.getDataSize());
+  m_dialog->SetChunkedProgress(m_local_player->pid, chunked_data.packet.getDataSize());
 
   sf::Packet progress_packet;
   progress_packet << MessageID::ChunkedDataProgress;
   progress_packet << cid;
-  progress_packet << u64{data_packet.getDataSize()};
+  progress_packet << u64{chunked_data.packet.getDataSize()};
   Send(progress_packet, CHUNKED_DATA_CHANNEL);
 }
 
 void NetPlayClient::OnChunkedDataAbort(sf::Packet& packet)
 {
-  u32 cid;
+  u32 cid{};
   packet >> cid;
+  if (!packet)
+  {
+    WARN_LOG_FMT(NETPLAY, "Ignoring invalid data chunk abort.");
+    return;
+  }
 
   const auto iter = m_chunked_data_receive_queue.find(cid);
   if (iter == m_chunked_data_receive_queue.end())

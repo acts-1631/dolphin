@@ -268,7 +268,7 @@ private:
   void DisplayPlayersPing();
   u32 GetPlayersMaxPing() const;
 
-  void OnData(sf::Packet& packet);
+  void OnData(sf::Packet& packet, bool is_chunked_payload = false);
   void OnPlayerJoin(sf::Packet& packet);
   void OnPlayerLeave(sf::Packet& packet);
   void OnChatMessage(sf::Packet& packet);
@@ -336,7 +336,12 @@ private:
   u16 m_sync_ar_codes_count = 0;
   u16 m_sync_ar_codes_success_count = 0;
   bool m_sync_ar_codes_complete = false;
-  std::unordered_map<u32, sf::Packet> m_chunked_data_receive_queue;
+  struct ChunkedData
+  {
+    u64 expected_size;
+    sf::Packet packet;
+  };
+  std::unordered_map<u32, ChunkedData> m_chunked_data_receive_queue;
 
   u64 m_initial_rtc = 0;
   u32 m_timebase_frame = 0;
