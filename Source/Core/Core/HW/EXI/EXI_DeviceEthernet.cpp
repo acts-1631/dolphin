@@ -26,6 +26,14 @@ namespace ExpansionInterface
 // Multiple parts of this implementation depend on Dolphin
 // being compiled for a little endian host.
 
+namespace
+{
+bool IsValidMXRange(u32 address, u32 size)
+{
+  return address <= BBA_MEM_SIZE && size <= BBA_MEM_SIZE - address;
+}
+}  // namespace
+
 CEXIETHERNET::CEXIETHERNET(Core::System& system, BBADeviceType type) : IEXIDevice(system)
 {
   // Parse MAC address from config, and generate a new one if it doesn't
@@ -216,8 +224,16 @@ u32 CEXIETHERNET::ImmRead(u32 size)
   }
   else
   {
-    for (int i = size - 1; i >= 0; i--)
-      ret |= mBbaMem[transfer.address++] << (i * 8);
+    if (!IsValidMXRange(transfer.address, size))
+    {
+      ERROR_LOG_FMT(SP1, "Invalid BBA MX read at {:04x} with size {}", transfer.address, size);
+      transfer.address += size;
+    }
+    else
+    {
+      for (int i = size - 1; i >= 0; i--)
+        ret |= mBbaMem[transfer.address++] << (i * 8);
+    }
   }
 
   DEBUG_LOG_FMT(SP1, "imm r{}: {:x}", size, ret);
@@ -248,6 +264,13 @@ void CEXIETHERNET::DMAWrite(u32 addr, u32 size)
 void CEXIETHERNET::DMARead(u32 addr, u32 size)
 {
   DEBUG_LOG_FMT(SP1, "DMA read: {:08x} {:x}", addr, size);
+  if (transfer.region != transfer.MX || transfer.direction != transfer.READ ||
+      !IsValidMXRange(transfer.address, size))
+  {
+    ERROR_LOG_FMT(SP1, "Invalid BBA MX DMA read at {:04x} with size {}", transfer.address, size);
+    return;
+  }
+
   auto& memory = m_system.GetMemory();
   memory.CopyToEmu(addr, &mBbaMem[transfer.address], size);
   transfer.address += size;
@@ -358,6 +381,13 @@ void CEXIETHERNET::MXHardReset()
 
 void CEXIETHERNET::MXCommandHandler(u32 data, u32 size)
 {
+  if (!IsValidMXRange(transfer.address, size))
+  {
+    ERROR_LOG_FMT(SP1, "Invalid BBA MX write at {:04x} with size {}", transfer.address, size);
+    transfer.address += size;
+    return;
+  }
+
   switch (transfer.address)
   {
   case BBA_NCRA:
