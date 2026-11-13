@@ -26,9 +26,9 @@ constexpr u16 MAX_TCP_LENGTH = 440;
 
 struct TcpBuffer
 {
-  bool used;
-  u64 tick;
-  u32 seq_id;
+  bool used = false;
+  u64 tick = 0;
+  u32 seq_id = 0;
   std::vector<u8> data;
 };
 
@@ -47,6 +47,9 @@ public:
   sf::Socket::Status Connect(const sf::IpAddress& dest, u16 port, u32 net_ip);
   sf::Socket::Status GetPeerName(sockaddr_in* addr) const;
   sf::Socket::Status GetSockName(sockaddr_in* addr) const;
+  bool IsDisconnected() const;
+  void MarkConnected();
+  void Disconnect();
 
   enum class ConnectingState
   {
@@ -73,23 +76,23 @@ public:
 struct StackRef
 {
   u32 ip = 0;
-  u16 local;
-  u16 remote;
-  u16 type;
-  u32 seq_num;
-  u32 ack_num;
-  u32 ack_base;
-  u16 window_size;
-  u64 delay;
+  u16 local = 0;
+  u16 remote = 0;
+  u16 type = 0;
+  u32 seq_num = 0;
+  u32 ack_num = 0;
+  u32 ack_base = 0;
+  u16 window_size = 0;
+  u64 delay = 0;
   std::array<TcpBuffer, MAX_TCP_BUFFER> tcp_buffers;
-  bool ready;
-  sockaddr_in from;
-  sockaddr_in to;
+  bool ready = false;
+  sockaddr_in from{};
+  sockaddr_in to{};
   Common::MACAddress bba_mac{};
   Common::MACAddress my_mac{};
   BbaUdpSocket udp_socket;
   BbaTcpSocket tcp_socket;
-  u64 poke_time;
+  u64 poke_time = 0;
 };
 
 // Max 10 at same time, I think most gc game had a

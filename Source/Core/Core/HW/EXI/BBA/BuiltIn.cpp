@@ -30,6 +30,8 @@ u64 GetTickCountStd()
   return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+constexpr u64 TCP_HANDSHAKE_TIMEOUT_MS = 10000;
+
 std::vector<u8> BuildFINFrame(StackRef* ref)
 {
   const Common::TCPPacket result(ref->bba_mac, ref->my_mac, ref->from, ref->to, ref->seq_num,
@@ -283,7 +285,7 @@ CEXIETHERNET::BuiltInBBAInterface::TryGetDataFromSocket(StackRef* ref)
                                      ref->ack_num, TCP_FLAG_RST | TCP_FLAG_ACK);
       WriteToQueue(result.Build());
       ref->ip = 0;
-      ref->tcp_socket.disconnect();
+      ref->tcp_socket.Disconnect();
       [[fallthrough]];
     }
     case BbaTcpSocket::ConnectingState::None:
@@ -291,6 +293,14 @@ CEXIETHERNET::BuiltInBBAInterface::TryGetDataFromSocket(StackRef* ref)
       return std::nullopt;
     case BbaTcpSocket::ConnectingState::Connected:
       break;
+    }
+
+    if (ref->tcp_socket.IsDisconnected() ||
+        (!ref->ready && GetTickCountStd() - ref->delay > TCP_HANDSHAKE_TIMEOUT_MS))
+    {
+      ref->ip = 0;
+      ref->tcp_socket.Disconnect();
+      return BuildFINFrame(ref);
     }
 
     sf::Socket::Status st = sf::Socket::Status::Done;
@@ -331,7 +341,7 @@ CEXIETHERNET::BuiltInBBAInterface::TryGetDataFromSocket(StackRef* ref)
       if (st == sf::Socket::Status::Disconnected || st == sf::Socket::Status::Error)
       {
         ref->ip = 0;
-        ref->tcp_socket.disconnect();
+        ref->tcp_socket.Disconnect();
         return BuildFINFrame(ref);
       }
     }
@@ -357,7 +367,7 @@ void CEXIETHERNET::BuiltInBBAInterface::HandleTCPFrame(const Common::TCPPacket& 
     ref->ip = 0;
     if (!data.empty())
       (void)ref->tcp_socket.send(data.data(), data.size());
-    ref->tcp_socket.disconnect();
+    ref->tcp_socket.Disconnect();
   }
   else if (flags == (TCP_FLAG_SIN | TCP_FLAG_ACK))
   {
@@ -375,8 +385,14 @@ void CEXIETHERNET::BuiltInBBAInterface::HandleTCPFrame(const Common::TCPPacket& 
     if (ref != nullptr)
       return;
     ref = m_network_ref.GetAvailableSlot(0);
+    if (ref == nullptr)
+    {
+      WARN_LOG_FMT(SP1, "No free BBA network slots for TCP connection");
+      return;
+    }
 
     ref->delay = GetTickCountStd();
+    ref->poke_time = ref->delay;
     ref->local = tcp_header.source_port;
     ref->remote = tcp_header.destination_port;
     ref->ack_num = ntohl(tcp_header.sequence_number) + 1;
@@ -480,6 +496,8 @@ void CEXIETHERNET::BuiltInBBAInterface::InitUDPPort(u16 port)
   ref->udp_socket.setBlocking(false);
   if (ref->udp_socket.Bind(port, m_current_ip) != sf::Socket::Status::Done)
   {
+    ref->ip = 0;
+    ref->udp_socket.unbind();
     ERROR_LOG_FMT(SP1, "Couldn't open UDP socket");
     PanicAlertFmtT(
         "Couldn't open port {0}. This might stop the game's LAN mode from working properly.", port);
@@ -496,6 +514,12 @@ void CEXIETHERNET::BuiltInBBAInterface::HandleUDPFrame(const Common::UDPPacket& 
                                    std::bit_cast<u32>(ip_header.destination_addr);
 
   StackRef* ref = m_network_ref.GetAvailableSlot(udp_header.source_port);
+  if (ref == nullptr)
+  {
+    WARN_LOG_FMT(SP1, "No free BBA network slots for UDP connection");
+    return;
+  }
+
   if (ref->ip == 0)
   {
     ref->ip = destination_addr;  // change for ip
@@ -517,6 +541,8 @@ void CEXIETHERNET::BuiltInBBAInterface::HandleUDPFrame(const Common::UDPPacket& 
           htons(udp_header.source_port));
       if (ref->udp_socket.Bind(sf::Socket::AnyPort, m_current_ip) != sf::Socket::Status::Done)
       {
+        ref->ip = 0;
+        ref->udp_socket.unbind();
         ERROR_LOG_FMT(SP1, "Couldn't open UDP socket");
         return;
       }
@@ -550,18 +576,20 @@ void CEXIETHERNET::BuiltInBBAInterface::HandleUPnPClient()
   if (ref->tcp_socket.GetPeerName(&ref->from) != sf::Socket::Status::Done ||
       ref->tcp_socket.GetSockName(&ref->to) != sf::Socket::Status::Done)
   {
+    ref->tcp_socket.Disconnect();
     ERROR_LOG_FMT(SP1, "Failed to accept new UPnP client: {}", Common::StrNetworkError());
     return;
   }
 
   if (m_current_ip == ref->from.sin_addr.s_addr)
   {
-    ref->tcp_socket.disconnect();
+    ref->tcp_socket.Disconnect();
     WARN_LOG_FMT(SP1, "Ignoring UPnP request to itself");
     return;
   }
 
   ref->delay = GetTickCountStd();
+  ref->poke_time = ref->delay;
   ref->ip = ref->from.sin_addr.s_addr;
   ref->local = ref->to.sin_port;
   ref->remote = ref->from.sin_port;
@@ -575,6 +603,7 @@ void CEXIETHERNET::BuiltInBBAInterface::HandleUPnPClient()
   ref->bba_mac = m_current_mac;
   ref->my_mac = ResolveAddress(ref->from.sin_addr.s_addr);
   ref->tcp_socket.setBlocking(false);
+  ref->tcp_socket.MarkConnected();
   ref->ready = false;
 
   Common::TCPPacket result(ref->bba_mac, ref->my_mac, ref->from, ref->to, ref->seq_num,
@@ -827,6 +856,33 @@ sf::Socket::Status BbaTcpSocket::GetSockName(sockaddr_in* addr) const
   return sf::Socket::Status::Done;
 }
 
+bool BbaTcpSocket::IsDisconnected() const
+{
+  const int fd = getNativeHandle();
+  const s32 nfds = fd + 1;
+  fd_set read_fds;
+  timeval timeout = {0, 0};
+  FD_ZERO(&read_fds);
+  FD_SET(fd, &read_fds);
+
+  if (select(nfds, &read_fds, nullptr, nullptr, &timeout) <= 0 || !FD_ISSET(fd, &read_fds))
+    return false;
+
+  char byte;
+  return recv(fd, &byte, sizeof(byte), MSG_PEEK) <= 0;
+}
+
+void BbaTcpSocket::MarkConnected()
+{
+  m_connecting_state = ConnectingState::Connected;
+}
+
+void BbaTcpSocket::Disconnect()
+{
+  disconnect();
+  m_connecting_state = ConnectingState::None;
+}
+
 BbaTcpSocket::ConnectingState BbaTcpSocket::Connected(StackRef* ref)
 {
   // Called by ReadThreadHandler's TryGetDataFromSocket
@@ -1022,7 +1078,7 @@ void NetworkRef::Clear()
   {
     if (ref.ip != 0)
     {
-      ref.type == IPPROTO_TCP ? ref.tcp_socket.disconnect() : ref.udp_socket.unbind();
+      ref.type == IPPROTO_TCP ? ref.tcp_socket.Disconnect() : ref.udp_socket.unbind();
     }
     ref.ip = 0;
   }
