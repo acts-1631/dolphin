@@ -8,8 +8,8 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 
-#include "Common/Align.h"
 #include "Common/IOFile.h"
 #include "Common/Image.h"
 #include "Common/Logging/Log.h"
@@ -166,7 +166,21 @@ struct DDSLoadInfo
 
 static constexpr u32 GetBlockCount(u32 extent, u32 block_size)
 {
-  return std::max(Common::DivideRoundingUp(extent, block_size), 1u);
+  return std::max(extent / block_size + static_cast<u32>(extent % block_size != 0), 1u);
+}
+
+static bool CalculateLevelSize(u32 blocks_wide, u32 blocks_high, u32 bytes_per_block, size_t* size)
+{
+  constexpr size_t max_size = std::numeric_limits<size_t>::max();
+  if (bytes_per_block == 0 || blocks_wide > max_size / bytes_per_block)
+    return false;
+
+  const size_t row_size = static_cast<size_t>(blocks_wide) * bytes_per_block;
+  if (blocks_high > max_size / row_size)
+    return false;
+
+  *size = row_size * blocks_high;
+  return true;
 }
 
 static u32 CalculateMipCount(u32 width, u32 height)
@@ -430,22 +444,31 @@ static bool ParseDDSHeader(File::IOFile& file, DDSLoadInfo* info)
   if (header.dwFlags & DDS_HEADER_FLAGS_PITCH && header.dwFlags & DDS_HEADER_FLAGS_LINEARSIZE)
   {
     // Convert pitch (in bytes) to texels/row length.
-    if (header.dwPitchOrLinearSize < info->bytes_per_block)
+    if (header.dwPitchOrLinearSize < info->bytes_per_block ||
+        header.dwPitchOrLinearSize % info->bytes_per_block != 0)
     {
       // Likely a corrupted or invalid file.
       return false;
     }
 
-    info->first_mip_row_length =
-        std::max(header.dwPitchOrLinearSize / info->bytes_per_block, 1u) * info->block_size;
-    info->first_mip_size = static_cast<size_t>(info->first_mip_row_length / info->block_size) *
-                           info->block_size * blocks_high;
+    const u32 row_blocks = header.dwPitchOrLinearSize / info->bytes_per_block;
+    if (row_blocks < blocks_wide ||
+        row_blocks > std::numeric_limits<u32>::max() / info->block_size ||
+        !CalculateLevelSize(row_blocks, blocks_high, info->bytes_per_block, &info->first_mip_size))
+    {
+      return false;
+    }
+    info->first_mip_row_length = row_blocks * info->block_size;
   }
   else
   {
     // Assume no padding between rows of blocks.
+    if (blocks_wide > std::numeric_limits<u32>::max() / info->block_size ||
+        !CalculateLevelSize(blocks_wide, blocks_high, info->bytes_per_block, &info->first_mip_size))
+    {
+      return false;
+    }
     info->first_mip_row_length = blocks_wide * info->block_size;
-    info->first_mip_size = blocks_wide * static_cast<size_t>(info->bytes_per_block) * blocks_high;
   }
 
   // Check for truncated or corrupted files.
@@ -474,6 +497,11 @@ static bool ReadMipLevel(VideoCommon::CustomTextureData::ArraySlice::Level* leve
   }
 
   // Copy to the final storage location.
+  const u64 file_position = file.Tell();
+  const u64 file_size = file.GetSize();
+  if (file_position > file_size || size > file_size - file_position)
+    return false;
+
   level->width = width;
   level->height = height;
   level->format = info.format;
@@ -532,8 +560,12 @@ bool LoadDDSTexture(CustomTextureData* texture, const std::string& filename)
       // Pitch can't be specified with each mip level, so we have to calculate it ourselves.
       u32 blocks_wide = GetBlockCount(mip_width, info.block_size);
       u32 blocks_high = GetBlockCount(mip_height, info.block_size);
+      if (blocks_wide > std::numeric_limits<u32>::max() / info.block_size)
+        break;
       u32 mip_row_length = blocks_wide * info.block_size;
-      size_t mip_size = blocks_wide * static_cast<size_t>(info.bytes_per_block) * blocks_high;
+      size_t mip_size;
+      if (!CalculateLevelSize(blocks_wide, blocks_high, info.bytes_per_block, &mip_size))
+        break;
       CustomTextureData::ArraySlice::Level level;
       if (!ReadMipLevel(&level, file, filename, i, info, mip_width, mip_height, mip_row_length,
                         mip_size))
