@@ -553,11 +553,23 @@ bool CEXIETHERNET::RecvHandlePacket()
   u8* write_ptr;
   Descriptor* descriptor;
   u32 status = 0;
-  u16 rwp_initial = page_ptr(BBA_RWP);
+  const u16 bp = page_ptr(BBA_BP);
+  const u16 rrp = page_ptr(BBA_RRP);
+  const u16 rwp = page_ptr(BBA_RWP);
+  const u16 rhbp = page_ptr(BBA_RHBP);
+  const u16 rwp_initial = rwp;
   u16 current_rwp = 0;
   u32 off = 4;
   if (!RecvMACFilter())
     goto wait_for_next;
+
+  if (bp == 0 || bp >= BBA_NUM_PAGES || rrp < bp || rrp > rhbp || rwp < bp || rwp > rhbp ||
+      rhbp >= BBA_NUM_PAGES)
+  {
+    WARN_LOG_FMT(SP1, "Dropping packet due to invalid BBA receive ring: {:x} {:x} {:x} {:x}", bp,
+                 rrp, rwp, rhbp);
+    goto wait_for_next;
+  }
 
 #ifdef BBA_TRACK_PAGE_PTRS
   INFO_LOG_FMT(SP1, "RecvHandlePacket {:x}\n{}", mRecvBufferLength,
@@ -568,10 +580,10 @@ bool CEXIETHERNET::RecvHandlePacket()
 #endif
   m_system.GetPowerPC().GetDebugInterface().NetworkLogger()->LogBBA(mRecvBuffer.get(),
                                                                     mRecvBufferLength);
-  write_ptr = &mBbaMem[page_ptr(BBA_RWP) << 8];
+  write_ptr = &mBbaMem[rwp << 8];
 
   descriptor = (Descriptor*)write_ptr;
-  current_rwp = page_ptr(BBA_RWP);
+  current_rwp = rwp;
   DEBUG_LOG_FMT(SP1, "Frame recv: {:x}", mRecvBufferLength);
   for (u32 i = 0; i < mRecvBufferLength; i++)
   {
@@ -582,11 +594,11 @@ bool CEXIETHERNET::RecvHandlePacket()
       off = 0;
       // avoid increasing the BBA register while copying
       // sometime the OS can try to process when it's not completed
-      current_rwp = current_rwp == page_ptr(BBA_RHBP) ? page_ptr(BBA_BP) : current_rwp + 1;
+      current_rwp = current_rwp == rhbp ? bp : current_rwp + 1;
 
       write_ptr = &mBbaMem[current_rwp << 8];
 
-      if (page_ptr(BBA_RRP) == current_rwp)
+      if (rrp == current_rwp)
       {
         /*
         halt copy
@@ -608,7 +620,7 @@ bool CEXIETHERNET::RecvHandlePacket()
 
   // Align up to next page
   if ((mRecvBufferLength + 4) % 256)
-    current_rwp = current_rwp == page_ptr(BBA_RHBP) ? page_ptr(BBA_BP) : current_rwp + 1;
+    current_rwp = current_rwp == rhbp ? bp : current_rwp + 1;
 
 #ifdef BBA_TRACK_PAGE_PTRS
   INFO_LOG_FMT(SP1, "{:x} {:x} {:x} {:x}", page_ptr(BBA_BP), page_ptr(BBA_RRP), page_ptr(BBA_RWP),
