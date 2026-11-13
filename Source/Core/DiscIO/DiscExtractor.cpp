@@ -7,6 +7,7 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -15,6 +16,8 @@
 #include "Common/CommonTypes.h"
 #include "Common/FileUtil.h"
 #include "Common/IOFile.h"
+#include "Common/NandPaths.h"
+#include "Common/StringUtil.h"
 #include "DiscIO/DiscUtils.h"
 #include "DiscIO/Enums.h"
 #include "DiscIO/Filesystem.h"
@@ -98,41 +101,118 @@ bool ExportFile(const Volume& volume, const Partition& partition, std::string_vi
   return ExportFile(volume, partition, file_system->FindFileInfo(path).get(), export_filename);
 }
 
-void ExportDirectory(const Volume& volume, const Partition& partition, const FileInfo& directory,
-                     bool recursive, const std::string& filesystem_path,
-                     const std::string& export_folder,
-                     const std::function<bool(const std::string& path)>& update_progress)
+namespace
 {
-  std::string export_root = export_folder + '/';
-  if (directory.IsDirectory() && !directory.IsRoot())
-    export_root += directory.GetName() + '/';
+bool IsPathWithin(const std::filesystem::path& root, const std::filesystem::path& path)
+{
+  auto root_it = root.begin();
+  auto path_it = path.begin();
+  while (root_it != root.end())
+  {
+    if (path_it == path.end() || *root_it != *path_it)
+      return false;
+    ++root_it;
+    ++path_it;
+  }
+  return path_it != path.end();
+}
 
-  File::CreateFullPath(export_root);
+std::optional<std::filesystem::path> ResolveExportPath(const std::filesystem::path& root,
+                                                       const std::filesystem::path& directory,
+                                                       std::string_view name)
+{
+  if (!Common::IsFileNameSafe(name))
+    return std::nullopt;
+
+  std::error_code error;
+  const std::filesystem::path path =
+      std::filesystem::weakly_canonical(directory / StringToPath(name), error);
+  if (error || !IsPathWithin(root, path))
+    return std::nullopt;
+  return path;
+}
+
+void ExportDirectoryInternal(const Volume& volume, const Partition& partition,
+                             const FileInfo& directory, bool recursive,
+                             const std::string& filesystem_path,
+                             const std::filesystem::path& export_root,
+                             const std::filesystem::path& current_export_directory,
+                             const std::function<bool(const std::string& path)>& update_progress)
+{
+  std::filesystem::path export_directory = current_export_directory;
+  if (directory.IsDirectory() && !directory.IsRoot())
+  {
+    const auto path = ResolveExportPath(export_root, export_directory, directory.GetName());
+    if (!path)
+    {
+      ERROR_LOG_FMT(DISCIO, "Refusing to export unsafe path component {}", directory.GetName());
+      return;
+    }
+    export_directory = *path;
+  }
+
+  if (!File::CreateFullPath(PathToString(export_directory) + '/'))
+  {
+    ERROR_LOG_FMT(DISCIO, "Could not create export directory {}", export_directory.string());
+    return;
+  }
 
   for (const FileInfo& file_info : directory)
   {
     const std::string name = file_info.GetName() + (file_info.IsDirectory() ? "/" : "");
     const std::string path = filesystem_path + name;
-    const std::string export_path = export_root + name;
 
     if (update_progress(path))
       return;
 
-    DEBUG_LOG_FMT(DISCIO, "{}", export_path);
+    const auto export_path = ResolveExportPath(export_root, export_directory, file_info.GetName());
+    if (!export_path)
+    {
+      ERROR_LOG_FMT(DISCIO, "Refusing to export unsafe path component {}", file_info.GetName());
+      continue;
+    }
+
+    const std::string export_path_string = PathToString(*export_path);
+    DEBUG_LOG_FMT(DISCIO, "{}", export_path_string);
 
     if (!file_info.IsDirectory())
     {
-      if (File::Exists(export_path))
-        NOTICE_LOG_FMT(DISCIO, "{} already exists", export_path);
-      else if (!ExportFile(volume, partition, &file_info, export_path))
-        ERROR_LOG_FMT(DISCIO, "Could not export {}", export_path);
+      if (File::Exists(export_path_string))
+        NOTICE_LOG_FMT(DISCIO, "{} already exists", export_path_string);
+      else if (!ExportFile(volume, partition, &file_info, export_path_string))
+        ERROR_LOG_FMT(DISCIO, "Could not export {}", export_path_string);
     }
     else if (recursive)
     {
-      ExportDirectory(volume, partition, file_info, recursive, filesystem_path, export_root,
-                      update_progress);
+      ExportDirectoryInternal(volume, partition, file_info, recursive, filesystem_path, export_root,
+                              export_directory, update_progress);
     }
   }
+}
+}  // namespace
+
+void ExportDirectory(const Volume& volume, const Partition& partition, const FileInfo& directory,
+                     bool recursive, const std::string& filesystem_path,
+                     const std::string& export_folder,
+                     const std::function<bool(const std::string& path)>& update_progress)
+{
+  if (!File::CreateFullPath(export_folder + '/'))
+  {
+    ERROR_LOG_FMT(DISCIO, "Could not create export directory {}", export_folder);
+    return;
+  }
+
+  std::error_code error;
+  const std::filesystem::path export_root =
+      std::filesystem::weakly_canonical(StringToPath(export_folder), error);
+  if (error)
+  {
+    ERROR_LOG_FMT(DISCIO, "Could not resolve export directory {}", export_folder);
+    return;
+  }
+
+  ExportDirectoryInternal(volume, partition, directory, recursive, filesystem_path, export_root,
+                          export_root, update_progress);
 }
 
 bool ExportWiiUnencryptedHeader(const Volume& volume, const std::string& export_filename)
